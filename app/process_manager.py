@@ -30,6 +30,34 @@ Rules encoded here:
   swap claiming the same old version while the first is still in progress is
   rejected before any process is started.  The API runs as a single process
   (enforced by a data-directory lock), so this one writer owns the budget.
+
+Crash recovery
+--------------
+
+If the *active* worker process dies unexpectedly, the registry takes the
+version out of service (inference gets ``NoActiveModel`` -> HTTP 503), frees
+its slot only after the exit is confirmed, and records exactly **one**
+automatic recovery attempt for that failure::
+
+    active --crash confirmed--> recovering --recovery load+test ok--> active
+                                     |
+                                     +-- recovery failed --> failed (no retry)
+                                     +-- manual upload won --> retired (superseded)
+
+* The recovered process keeps the **same version id**; a per-version
+  ``generation`` counter distinguishes the old process from the new one.
+* ``accept_work`` hands out the current generation and ``complete_work``
+  ignores completions tagged with an older generation, so a late callback
+  from the crashed process can never corrupt the new process's counters.
+* Requests that were in flight when the process died are settled as
+  ``failed`` on the old slot; they are never replayed to the new process.
+* A manual upload may load in parallel in the other slot and takes priority:
+  ``commit_recovery`` only succeeds while no version is active, and
+  ``commit_swap`` tolerates the old version having crashed (or recovered)
+  while the manual swap was in flight.  A superseded recovery stops only its
+  own candidate process.
+* Retired (draining) and failed versions are **not** recovered: only the
+  active version self-heals.
 """
 
 from __future__ import annotations
@@ -55,6 +83,12 @@ VERSION_LOADING = "loading"
 VERSION_ACTIVE = "active"
 VERSION_RETIRED = "retired"
 VERSION_FAILED = "failed"
+VERSION_RECOVERING = "recovering"
+
+RECOVERY_IN_PROGRESS = "in_progress"
+RECOVERY_SUCCEEDED = "succeeded"
+RECOVERY_FAILED = "failed"
+RECOVERY_SUPERSEDED = "superseded"
 
 CLAIM_NONE = "__none__"
 
@@ -101,6 +135,7 @@ class Registry:
                 "in_flight": 0,
                 "accepted": 0,
                 "completed": 0,
+                "failed": 0,
                 "started_at": None,
                 "idle_since": now,
                 "generation": 0,
@@ -200,6 +235,7 @@ class Registry:
             previous = self._versions.get(version)
             attempt = 1
             previous_error = None
+            generation = 1
             if previous is not None:
                 if previous["state"] != VERSION_FAILED:
                     raise SwapConflict(
@@ -207,6 +243,7 @@ class Registry:
                     )
                 attempt = int(previous.get("attempt", 1)) + 1
                 previous_error = previous.get("error")
+                generation = int(previous.get("generation", 1)) + 1
             free = sorted(
                 sid
                 for sid, s in self._slots.items()
@@ -227,6 +264,7 @@ class Registry:
                 in_flight=0,
                 accepted=0,
                 completed=0,
+                failed=0,
                 started_at=now,
                 idle_since=None,
                 generation=slot["generation"] + 1,
@@ -245,6 +283,8 @@ class Registry:
                 "error": None,
                 "attempt": attempt,
                 "previous_error": previous_error,
+                "generation": generation,
+                "recovery": None,
             }
             return slot_id
 
@@ -314,12 +354,30 @@ class Registry:
     def commit_swap(self, version: str, old_version: Optional[str], token: str) -> None:
         with self._lock:
             active = self._state["active_version"]
+            retire = old_version
             if active != old_version:
-                raise SwapConflict(
-                    f"active version changed from {old_version!r} to {active!r}; "
-                    "candidate was not promoted"
-                )
-            key = active if active is not None else CLAIM_NONE
+                if old_version is None and active is not None:
+                    # The swap began while no model was active; a crash
+                    # recovery has since brought a version back.  The manual
+                    # upload takes priority and retires whatever serves now.
+                    retire = active
+                elif (
+                    old_version is not None
+                    and active is None
+                    and (self._versions.get(old_version) or {}).get("state")
+                    in (VERSION_RECOVERING, VERSION_FAILED)
+                ):
+                    # The old version crashed out from under this swap; there
+                    # is nothing left to retire.
+                    retire = None
+                else:
+                    raise SwapConflict(
+                        f"active version changed from {old_version!r} to {active!r}; "
+                        "candidate was not promoted"
+                    )
+            # The claim is keyed by the version observed when the swap began,
+            # which is exactly the key ``begin_swap`` used.
+            key = old_version if old_version is not None else CLAIM_NONE
             if self._claims.get(key) != token:
                 raise SwapConflict("swap claim was lost")
             info = self._versions.get(version)
@@ -328,16 +386,16 @@ class Registry:
             if not info.get("tested_at"):
                 raise SwapConflict(f"version {version!r} has not passed its smoke test")
 
-            if active is not None:
-                old = dict(self._versions[active])
+            if retire is not None:
+                old = dict(self._versions[retire])
                 old.update(
                     state=VERSION_RETIRED,
                     process_state=STATE_DRAINING,
                     retired_at=time.time(),
                 )
-                self._versions[active] = old
+                self._versions[retire] = old
                 old_slot = self._slots.get(old["slot_id"])
-                if old_slot is not None and old_slot["version"] == active:
+                if old_slot is not None and old_slot["version"] == retire:
                     old_slot = dict(old_slot)
                     old_slot["process_state"] = STATE_DRAINING
                     self._slots[old["slot_id"]] = old_slot
@@ -358,12 +416,17 @@ class Registry:
             self._state["active_version"] = version
             del self._claims[key]
 
-    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str]:
+    def accept_work(self, n_features: Optional[int] = None) -> Tuple[str, str, int]:
         """Pin an inference to the active version and count it in-flight.
 
         With ``n_features`` the request is validated against the active
         version's input width inside the same critical section, so a rejected
         request never touches the in-flight counter.
+
+        Returns ``(version, slot_id, generation)``.  The generation identifies
+        the *process* the work was accepted for; it must be handed back to
+        ``complete_work`` so a late completion from a crashed process cannot
+        be booked against the recovered process of the same version.
         """
         with self._lock:
             version = self._state["active_version"]
@@ -394,12 +457,25 @@ class Registry:
             slot["in_flight"] += 1
             slot["accepted"] += 1
             self._slots[info["slot_id"]] = slot
-            return version, info["slot_id"]
+            return version, info["slot_id"], int(info.get("generation", 1))
 
-    def complete_work(self, version: str) -> None:
+    def complete_work(self, version: str, generation: Optional[int] = None) -> None:
+        """Book one settled inference against the process that accepted it.
+
+        ``generation`` is the process generation returned by ``accept_work``.
+        A completion arriving with an older generation belongs to a process
+        that has since exited (e.g. a crashed worker whose version was
+        recovered in a new process) and is ignored, so the new process's
+        counters stay accurate.
+        """
         with self._lock:
             info = self._versions.get(version)
             if info is None:
+                return
+            if generation is not None and int(info.get("generation", 1)) != int(
+                generation
+            ):
+                # Late callback from a previous process of this version.
                 return
             slot = self._slots.get(info["slot_id"])
             if slot is None or slot["version"] != version:
@@ -475,7 +551,8 @@ class Registry:
 
         Called by the drain/reaper loop once the OS process is gone: the
         corresponding HTTP calls have failed or will fail, so keeping the
-        counter raised would wedge the slot forever.
+        counter raised would wedge the slot forever.  The interrupted
+        requests are counted as ``failed``, not ``completed``.
         """
         with self._lock:
             info = self._versions.get(version)
@@ -487,9 +564,240 @@ class Registry:
             if slot["in_flight"] == 0:
                 return False
             slot = dict(slot)
-            slot["completed"] += slot["in_flight"]
+            slot["failed"] = int(slot.get("failed", 0)) + int(slot["in_flight"])
             slot["in_flight"] = 0
             self._slots[info["slot_id"]] = slot
+            return True
+
+    # ------------------------------------------------------------------
+    # Crash recovery of the active version
+    # ------------------------------------------------------------------
+    def begin_recovery(self, version: str, reason: str) -> Optional[Dict[str, Any]]:
+        """Take a crashed active version out of service and arm one recovery.
+
+        The caller must have confirmed the OS process exited.  The slot is
+        freed immediately (the process is gone), in-flight work is settled as
+        failed, and the version moves to ``recovering`` so inference reports
+        ``NoActiveModel`` until the recovery commits.  Returns the recovery
+        context (attempt + new process generation) or ``None`` when the
+        version is not active any more -- which is what makes a second
+        recovery for the *same* failure impossible.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_ACTIVE:
+                return None
+            now = time.time()
+            crashed_in_flight = 0
+            slot = self._slots.get(info["slot_id"])
+            if slot is not None and slot["version"] == version:
+                crashed_in_flight = int(slot["in_flight"])
+                slot = dict(slot)
+                slot.update(
+                    version=None,
+                    process_state=STATE_IDLE,
+                    pid=None,
+                    in_flight=0,
+                    failed=int(slot.get("failed", 0)) + crashed_in_flight,
+                    idle_since=now,
+                )
+                self._slots[info["slot_id"]] = slot
+            previous = info.get("recovery") or {}
+            generation = int(info.get("generation", 1)) + 1
+            recovery = {
+                "attempt": int(previous.get("attempt", 0)) + 1,
+                "state": RECOVERY_IN_PROGRESS,
+                "reason": reason,
+                "error": None,
+                "started_at": now,
+                "tested_at": None,
+                "finished_at": None,
+                "crashed_pid": info.get("pid"),
+                "crashed_generation": info.get("generation", 1),
+                "crashed_in_flight": crashed_in_flight,
+                "recovered_pid": None,
+                "recovered_generation": generation,
+            }
+            info = dict(info)
+            info.update(
+                state=VERSION_RECOVERING,
+                process_state=STATE_IDLE,
+                pid=None,
+                generation=generation,
+                recovery=recovery,
+            )
+            self._versions[version] = info
+            if self._state["active_version"] == version:
+                self._state["active_version"] = None
+            return {
+                "version": version,
+                "attempt": recovery["attempt"],
+                "generation": generation,
+            }
+
+    def reserve_recovery_slot(self, version: str) -> str:
+        """Reserve a free slot for the recovery process of ``version``.
+
+        Only a version in ``recovering`` state may reserve one; the version
+        keeps its identity and its (already bumped) generation.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_RECOVERING:
+                raise SwapConflict(f"version {version!r} is not recovering")
+            free = sorted(
+                sid
+                for sid, s in self._slots.items()
+                if s["process_state"] == STATE_IDLE
+            )
+            if not free:
+                raise NoCapacity(
+                    f"no free process slot for the recovery of {version!r}"
+                )
+            slot_id = free[0]
+            now = time.time()
+            slot = dict(self._slots[slot_id])
+            slot.update(
+                version=version,
+                process_state=STATE_LOADING,
+                pid=None,
+                in_flight=0,
+                accepted=0,
+                completed=0,
+                failed=0,
+                started_at=now,
+                idle_since=None,
+                generation=slot["generation"] + 1,
+            )
+            self._slots[slot_id] = slot
+            info = dict(info)
+            info.update(slot_id=slot_id, process_state=STATE_LOADING, pid=None)
+            self._versions[version] = info
+            return slot_id
+
+    def mark_recovery_tested(self, version: str, generation: int) -> None:
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_RECOVERING:
+                raise SwapConflict(f"version {version!r} is not recovering")
+            if int(info.get("generation", 1)) != int(generation):
+                raise SwapConflict(f"recovery of {version!r} is stale")
+            recovery = dict(info.get("recovery") or {})
+            recovery["tested_at"] = time.time()
+            info = dict(info)
+            info["recovery"] = recovery
+            self._versions[version] = info
+
+    def commit_recovery(self, version: str, generation: int) -> str:
+        """Promote the recovered process back to active, same version id.
+
+        Returns ``"committed"`` or ``"superseded"`` -- the latter when a
+        manual upload became active while the recovery was in flight.  In
+        that case nothing is changed; the caller stops its own candidate and
+        calls ``recovery_superseded``.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_RECOVERING:
+                raise SwapConflict(f"version {version!r} is not recovering")
+            if int(info.get("generation", 1)) != int(generation):
+                raise SwapConflict(f"recovery of {version!r} is stale")
+            recovery = info.get("recovery") or {}
+            if not recovery.get("tested_at"):
+                raise SwapConflict(
+                    "recovery candidate has not passed its smoke test"
+                )
+            if self._state["active_version"] is not None:
+                return RECOVERY_SUPERSEDED
+            now = time.time()
+            recovery = dict(recovery)
+            recovery.update(
+                state=RECOVERY_SUCCEEDED,
+                finished_at=now,
+                recovered_pid=info.get("pid"),
+            )
+            info = dict(info)
+            info.update(
+                state=VERSION_ACTIVE,
+                process_state=STATE_ACTIVE,
+                activated_at=now,
+                error=None,
+                recovery=recovery,
+            )
+            self._versions[version] = info
+            slot = self._slots.get(info["slot_id"])
+            if slot is None or slot["version"] != version:
+                raise SwapConflict("recovery slot ownership changed")
+            slot = dict(slot)
+            slot["process_state"] = STATE_ACTIVE
+            self._slots[info["slot_id"]] = slot
+            self._state["active_version"] = version
+            return "committed"
+
+    def fail_recovery(self, version: str, error: str) -> bool:
+        """Mark the recovery attempt failed; never retries automatically."""
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_RECOVERING:
+                return False
+            now = time.time()
+            recovery = dict(info.get("recovery") or {})
+            recovery.update(state=RECOVERY_FAILED, error=error, finished_at=now)
+            info = dict(info)
+            info.update(
+                state=VERSION_FAILED,
+                process_state=STATE_IDLE,
+                error=f"recovery failed: {error}",
+                retired_at=now,
+                recovery=recovery,
+            )
+            self._versions[version] = info
+            slot = self._slots.get(info["slot_id"])
+            if slot is not None and slot["version"] == version:
+                slot = dict(slot)
+                slot.update(
+                    version=None,
+                    process_state=STATE_IDLE,
+                    pid=None,
+                    in_flight=0,
+                    idle_since=now,
+                )
+                self._slots[info["slot_id"]] = slot
+            return True
+
+    def recovery_superseded(self, version: str) -> bool:
+        """Record that a manual upload took over while recovery was in flight.
+
+        The recovery candidate's process must already have exited (the caller
+        stops it first); its slot is freed and the version is left ``retired``
+        -- it neither takes over nor disturbs the version that won.
+        """
+        with self._lock:
+            info = self._versions.get(version)
+            if info is None or info["state"] != VERSION_RECOVERING:
+                return False
+            now = time.time()
+            recovery = dict(info.get("recovery") or {})
+            recovery.update(state=RECOVERY_SUPERSEDED, finished_at=now)
+            info = dict(info)
+            info.update(
+                state=VERSION_RETIRED,
+                process_state=STATE_IDLE,
+                retired_at=now,
+                recovery=recovery,
+            )
+            self._versions[version] = info
+            slot = self._slots.get(info["slot_id"])
+            if slot is not None and slot["version"] == version:
+                slot = dict(slot)
+                slot.update(
+                    version=None,
+                    process_state=STATE_IDLE,
+                    pid=None,
+                    in_flight=0,
+                    idle_since=now,
+                )
+                self._slots[info["slot_id"]] = slot
             return True
 
 
@@ -589,6 +897,10 @@ class WorkerHandle:
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    @property
+    def returncode(self) -> Optional[int]:
+        return self._proc.returncode if self._proc is not None else None
+
     def wait_exit(self, timeout: float) -> bool:
         if self._proc is None:
             return True
@@ -597,6 +909,16 @@ class WorkerHandle:
             return True
         except subprocess.TimeoutExpired:
             return False
+
+    def kill(self) -> None:
+        """SIGKILL the process group immediately (demo: simulate a hard crash)."""
+        if self._proc is None:
+            return
+        if self._proc.poll() is not None:
+            self._proc.wait()
+            return
+        self._signal_group(signal.SIGKILL)
+        self.wait_exit(10.0)
 
     def stop(self, timeout: float = 10.0) -> None:
         """Terminate the process group and reap the child."""

@@ -3,15 +3,18 @@
 A FastAPI + NumPy inference service for an edge quality-control machine with a
 hard constraint: **the machine can host at most two model processes**. Models
 are replaced online — without dropping accepted inference and without ever
-running a third model process.
+running a third model process — and the active model **heals itself after a
+process crash**: the saved weights are reloaded in a fresh process under the
+same version id, no re-upload needed.
 
 ```
-POST /infer           classify a feature vector (with optional client timeout)
-POST /admin/models    upload weights/bias/labels and hot-swap the model in
-GET  /admin/versions  version registry
-GET  /admin/status    active version, in-flight counts, per-process state
-GET  /healthz         liveness
-GET  /docs            Swagger UI (interactive; shows every field)
+POST /infer                 classify a feature vector (with optional client timeout)
+POST /admin/models          upload weights/bias/labels and hot-swap the model in
+GET  /admin/versions        version registry
+GET  /admin/status          active version, in-flight counts, per-process state
+POST /admin/demo/kill-active  demo: SIGKILL the active model to watch recovery
+GET  /healthz               liveness
+GET  /docs                  Swagger UI (interactive; shows every field)
 ```
 
 ## Running it
@@ -77,6 +80,10 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
 ```
 (vacant) --reserve--> loading --commit--> active --retire--> draining --exit--> idle
                            └── load/test failed ──────────────> failed (slot freed)
+
+active --crash confirmed--> recovering --recovery load+test ok--> active (same version)
+                                 ├── recovery load/test failed --> failed (no retry)
+                                 └── manual upload won ---------> retired (superseded)
 ```
 
 * **At most two model processes.** A slot is reserved only when it is `idle`.
@@ -112,9 +119,35 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   claims its old version in the registry before starting a process. A second
   swap from the same old version gets 409 immediately and never spawns a
   process. A stale `expected_active_version` also yields 409.
-* **Crashed workers are reclaimed.** If a worker dies unexpectedly, its slot
-  is released and, if it was active, the service reports 503 (no active model)
-  rather than routing to a dead process.
+* **A crashed active model recovers itself, once.** If the active worker
+  process dies, the API confirms the OS process exited, takes the version out
+  of service (`recovering`; `/infer` returns 503), and starts exactly one
+  recovery for that failure: the version's saved artifact
+  (`models/<version>.json`) is loaded in a new process, smoke-tested, and
+  promoted under the **same version id**. A failed recovery is final — no
+  retry loop — and with no usable model the service keeps returning 503 until
+  a manual upload. A later, *new* crash of the recovered process is a new
+  failure and gets its own single recovery.
+* **Unfinished requests fail; they are never replayed.** Requests in flight
+  when the process dies get 502 and are settled as `failed` on the old slot.
+  `accept_work` tags each request with the process `generation`; a late
+  completion callback from the dead process carries a stale generation and is
+  ignored, so the recovered process's counters stay exact.
+* **A manual upload outranks a recovery.** While a recovery is loading, a
+  manual upload may load in parallel in the free slot and takes over: the
+  late recovery commits only if nothing else became active, otherwise it
+  stops its own candidate (`superseded`) and never touches the new version.
+  If the recovery commits first, the manual swap simply retires it.
+* **Draining versions do not self-heal.** Only the *active* version is
+  recovered; a retired process that dies is just reaped and its slot freed.
+  Loading + active + draining processes together still never exceed two, and
+  a slot is reused only after the previous process's exit is confirmed.
+* **Status distinguishes the old and new process of a version.** Each version
+  record carries a `generation` (incremented per process) and a `recovery`
+  object: attempt counter, result (`in_progress` / `succeeded` / `failed` /
+  `superseded`), and the crashed vs recovered pid/generation. Slots report
+  `failed` (requests interrupted by a crash) alongside `accepted` /
+  `completed`.
 
 ## Demo scenarios
 
@@ -129,8 +162,14 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
    becomes active and the slow version goes `draining`. A third upload returns
    429 while the slow computation still runs. After it finishes the slot is
    released and the upload succeeds.
+4. **Crash recovery.** `POST /admin/demo/kill-active` (optionally with
+   `{"recovery_delay_ms": 3000}`) SIGKILLs the active model process. The
+   version goes `recovering`, `/infer` returns 503, and the saved weights are
+   loaded in a new process that takes over under the same version id — watch
+   the old vs new pid/generation in `/admin/status`. Upload a new version
+   during the delay and it wins; the late recovery steps aside (`superseded`).
 
-`python examples/demo.py <base-url>` runs all three end to end.
+`python examples/demo.py <base-url>` runs all of them end to end.
 
 ## Observations from the smoke runs
 
@@ -140,6 +179,11 @@ Two fixed slots, `slot-0` and `slot-1`, are the two-process budget.
   (verified: 429 until the slow request finished, then `idle`).
 - SIGTERM with an in-flight request: the request completed with 200, the API
   exited 0/-15 cleanly, and no worker processes remained.
+- SIGKILL on the active worker: the version went `recovering` within ~100 ms,
+  `/infer` returned 503, and the same version id was back active on a new pid
+  ~1 s later (plus the demo delay when configured). A slow request in flight
+  at the kill got 502 and the recovered process's counters showed only its
+  own work.
 
 ## Layout
 
@@ -152,8 +196,8 @@ app/
   models.py           artifact validation, NumPy scoring
 tests/
   test_models.py          artifact validation + scoring
-  test_registry.py        state machine, claims, drain gate, crash reclaim
-  test_api_integration.py real API + real worker processes
+  test_registry.py        state machine, claims, drain gate, crash recovery
+  test_api_integration.py real API + real worker processes, crash-recovery runs
 examples/
   demo.py, models/*.json
 ```
@@ -166,5 +210,6 @@ examples/
 | `DEFAULT_INFER_TIMEOUT_MS` | `5000` | client wait when `timeout_ms` is omitted |
 | `SWAP_WAIT_SECONDS` | `3` | how long an upload waits for a draining slot before 429 |
 | `SHUTDOWN_GRACE_SECONDS` | `20` | how long shutdown waits for in-flight work |
+| `RECOVERY_DELAY_MS` | `0` | demo: delay every automatic recovery's readiness |
 | `BOOTSTRAP_VERSION` / `BOOTSTRAP_MODEL` | unset | optionally load one artifact at startup |
 | `LOG_LEVEL` | `INFO` | logging |

@@ -373,3 +373,187 @@ def test_12_no_model_after_shutdown(api):
     assert httpx.get(f"{api.base}/healthz", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/docs", timeout=5).status_code == 200
     assert httpx.get(f"{api.base}/openapi.json", timeout=5).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery of the active model process
+# ---------------------------------------------------------------------------
+
+
+def kill_active(api: ApiServer, recovery_delay_ms=0):
+    return httpx.post(
+        f"{api.base}/admin/demo/kill-active",
+        json={"recovery_delay_ms": recovery_delay_ms},
+        timeout=15.0,
+    )
+
+
+def version_view(api: ApiServer, version: str):
+    return next(v for v in status(api)["versions"] if v["version"] == version)
+
+
+def test_13_active_crash_recovers_same_version(api):
+    active = status(api)["active_version"]
+    assert active is not None
+    before = version_view(api, active)
+    assert before["generation"] == 1
+    crashed_pid = before["pid"]
+    expected_label = infer(api, [0.9, 0.1]).json()["label"]
+
+    resp = kill_active(api, recovery_delay_ms=2500)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["killed"]["version"] == active
+    assert resp.json()["killed"]["pid"] == crashed_pid
+
+    # The version leaves service; inference gets 503 while it recovers.
+    wait_for(lambda: status(api)["active_version"] is None)
+    r = infer(api, [0.9, 0.1])
+    assert r.status_code == 503
+    assert r.json()["detail"]["error"] == "no_active_model"
+    # Status stays queryable during the recovery and shows it in progress.
+    st = status(api)
+    view = next(v for v in st["versions"] if v["version"] == active)
+    assert view["state"] == "recovering"
+    assert view["recovery"]["state"] == "in_progress"
+    assert view["recovery"]["attempt"] == 1
+    assert view["recovery"]["crashed_pid"] == crashed_pid
+
+    # The recovery commits under the same version id, on a new process.
+    wait_for(lambda: status(api)["active_version"] == active, timeout=30)
+    st = status(api)
+    view = next(v for v in st["versions"] if v["version"] == active)
+    assert view["state"] == "active"
+    assert view["generation"] == 2
+    assert view["pid"] != crashed_pid
+    rec = view["recovery"]
+    assert rec["state"] == "succeeded"
+    assert rec["crashed_generation"] == 1
+    assert rec["recovered_generation"] == 2
+    assert rec["recovered_pid"] == view["pid"]
+
+    result = infer(api, [0.9, 0.1])
+    assert result.status_code == 200
+    assert result.json()["version"] == active
+    assert result.json()["label"] == expected_label
+
+
+def test_14_in_flight_request_fails_at_crash_and_is_not_replayed(api):
+    active = status(api)["active_version"]
+    crashed_pid = version_view(api, active)["pid"]
+    import threading
+
+    responses = []
+
+    def slow_call():
+        responses.append(infer(api, [0.9, 0.1], slow_ms=5000, timeout_ms=30000))
+
+    t = threading.Thread(target=slow_call)
+    t.start()
+    wait_for(lambda: status(api)["total_in_flight"] == 1)
+
+    assert kill_active(api).status_code == 200
+    t.join(timeout=20)
+    # The unfinished request fails; it is never replayed on the new process.
+    assert len(responses) == 1
+    assert responses[0].status_code == 502, responses[0].text
+    assert responses[0].json()["detail"]["error"] == "worker_unreachable"
+
+    wait_for(lambda: status(api)["active_version"] == active, timeout=30)
+    view = version_view(api, active)
+    assert view["recovery"]["state"] == "succeeded"
+    assert view["recovery"]["crashed_pid"] == crashed_pid
+
+    # Exactly one new inference: the recovered process's counters reflect
+    # only its own work (no pollution from the crashed process's callback).
+    assert infer(api, [0.9, 0.1]).status_code == 200
+    st = status(api)
+    slot = next(s for s in st["slots"] if s["version"] == active)
+    assert slot["accepted"] == 1
+    assert slot["completed"] == 1
+    assert slot["in_flight"] == 0
+    assert st["total_in_flight"] == 0
+
+
+def test_15_failed_recovery_stops_and_serves_503(api):
+    active = status(api)["active_version"]
+    # Corrupt the saved artifact so the recovery load fails.
+    artifact_path = api.data_dir / "models" / f"{active}.json"
+    assert artifact_path.is_file()
+    artifact_path.write_text("{ not json", encoding="utf-8")
+
+    assert kill_active(api).status_code == 200
+    wait_for(lambda: version_view(api, active)["state"] == "failed", timeout=30)
+    view = version_view(api, active)
+    assert view["recovery"]["state"] == "failed"
+    assert "recovery failed" in view["error"]
+    assert status(api)["active_version"] is None
+    assert infer(api, [0.9, 0.1]).status_code == 503
+
+    # No retry loop: the failure is final and no process is spawned again.
+    time.sleep(2.0)
+    st = status(api)
+    assert version_view(api, active)["state"] == "failed"
+    assert st["slots_in_use"] == 0
+    # The demo kill now has nothing to kill.
+    assert kill_active(api).status_code == 409
+
+    # Manual re-upload of the same (failed) version id restores service.
+    resp = upload(api, artifact(active, W_A, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    assert status(api)["active_version"] == active
+    assert infer(api, [0.9, 0.1]).json()["label"] == "defect-A"
+
+
+def test_16_manual_upload_takes_priority_over_delayed_recovery(api):
+    active = status(api)["active_version"]
+    assert kill_active(api, recovery_delay_ms=4000).status_code == 200
+    wait_for(lambda: version_view(api, active)["state"] == "recovering")
+
+    # A manual upload loads in parallel in the free slot and takes over.
+    resp = upload(api, artifact("manual-takeover", W_B, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    assert status(api)["active_version"] == "manual-takeover"
+    takeover_pid = version_view(api, "manual-takeover")["pid"]
+
+    # The late recovery neither takes over nor stops the new version.
+    wait_for(
+        lambda: version_view(api, active)["recovery"]["state"] == "superseded",
+        timeout=30,
+    )
+    view = version_view(api, active)
+    assert view["state"] == "retired"
+    st = status(api)
+    assert st["active_version"] == "manual-takeover"
+    assert version_view(api, "manual-takeover")["pid"] == takeover_pid
+    wait_for(lambda: status(api)["slots_in_use"] == 1, timeout=15)
+    assert infer(api, [0.9, 0.1]).json()["version"] == "manual-takeover"
+
+
+def test_17_draining_version_does_not_self_heal(api):
+    import signal
+
+    assert status(api)["active_version"] == "manual-takeover"
+    # Park a slow request on the active version, then swap it out so it drains.
+    r = infer(api, [0.9, 0.1], slow_ms=3000, timeout_ms=150)
+    assert r.status_code == 504
+    resp = upload(api, artifact("post-takeover", W_A, [0.0, 0.0], LABELS))
+    assert resp.status_code == 201, resp.text
+    st = status(api)
+    assert st["active_version"] == "post-takeover"
+    draining = next(s for s in st["slots"] if s["version"] == "manual-takeover")
+    assert draining["process_state"] == "draining"
+    assert draining["in_flight"] == 1
+
+    # Kill the draining process: no recovery is started for it.
+    os.kill(draining["pid"], signal.SIGKILL)
+    wait_for(
+        lambda: version_view(api, "manual-takeover")["process_state"] == "idle",
+        timeout=15,
+    )
+    view = version_view(api, "manual-takeover")
+    assert view["state"] == "retired"
+    assert view["recovery"] is None
+    st = status(api)
+    assert st["active_version"] == "post-takeover"
+    assert st["slots_in_use"] == 1
+    assert infer(api, [0.9, 0.1]).json()["version"] == "post-takeover"

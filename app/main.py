@@ -2,17 +2,25 @@
 
 Public surface (see ``/docs``):
 
-* ``POST /infer``            -- classify a feature vector with a client timeout
-* ``POST /admin/models``     -- upload a classifier artifact and hot-swap it in
-* ``GET  /admin/versions``   -- version registry
-* ``GET  /admin/status``     -- active version, in-flight counts, process states
-* ``GET  /healthz``          -- liveness
+* ``POST /infer``                -- classify a feature vector with a client timeout
+* ``POST /admin/models``         -- upload a classifier artifact and hot-swap it in
+* ``GET  /admin/versions``       -- version registry
+* ``GET  /admin/status``         -- active version, in-flight counts, process states
+* ``POST /admin/demo/kill-active`` -- demo: SIGKILL the active model process
+* ``GET  /healthz``              -- liveness
 
 The invariants live in ``app/process_manager.py``.  In short: every model
 version runs in its own OS process, at most two such processes exist at once,
 requests are pinned to the version active at admission, and a retired version
 only releases its slot once every inference it actually accepted has finished
 inside its worker -- regardless of whether the client is still waiting.
+
+If the *active* worker process crashes, the service confirms the exit, takes
+the version out of service (inference gets 503), and starts exactly one
+automatic recovery: the saved artifact is loaded in a fresh process,
+smoke-tested, and promoted under the **same version id**.  A failed recovery
+is never retried; a manual upload may take over in parallel and a late
+recovery then steps aside without disturbing the new version.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ from app.process_manager import (
     VERSION_ACTIVE,
     VERSION_FAILED,
     VERSION_LOADING,
+    VERSION_RECOVERING,
     VERSION_RETIRED,
     FeatureMismatch,
     NoActiveModel,
@@ -66,6 +75,10 @@ MAX_TIMEOUT_MS = 600_000
 SWAP_WAIT_SECONDS = float(os.environ.get("SWAP_WAIT_SECONDS", "3"))
 # How long shutdown waits for accepted inference to finish before killing workers.
 SHUTDOWN_GRACE_SECONDS = float(os.environ.get("SHUTDOWN_GRACE_SECONDS", "20"))
+# Demo hook: default delay applied to a recovered worker's readiness, so the
+# "recovering" state (and 503s) can be observed.  The kill endpoint accepts a
+# one-shot override.
+RECOVERY_DELAY_MS = int(os.environ.get("RECOVERY_DELAY_MS", "0"))
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +174,8 @@ class SlotView(BaseModel):
     in_flight: int
     accepted: int
     completed: int
+    failed: int
+    generation: int
     alive: Optional[bool]
 
 
@@ -170,6 +185,7 @@ class StatusView(BaseModel):
     total_in_flight: int
     total_accepted: int
     total_completed: int
+    total_failed: int
     slots_in_use: int
     capacity: int
     slots: List[SlotView]
@@ -188,6 +204,20 @@ class SwapResult(BaseModel):
     load_seconds: float
 
 
+class KillActiveRequest(BaseModel):
+    recovery_delay_ms: int = Field(
+        0,
+        ge=0,
+        le=120_000,
+        description=(
+            "Demo hook: delay the automatic recovery's load (worker readiness) "
+            "by this many milliseconds, so the 'recovering' state and the 503 "
+            "responses are easy to observe. During the delay a manual upload "
+            "can take over; the late recovery then steps aside."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Inference service
 # ---------------------------------------------------------------------------
@@ -203,6 +233,8 @@ class InferenceService:
         self._closing = False
         self._draining: set[str] = set()
         self._background: set[asyncio.Task] = set()
+        self._recovery_tasks: set[asyncio.Task] = set()
+        self._recovery_delay_override_ms: Optional[int] = None
         self._swap_lock = asyncio.Lock()  # serialises swaps inside this process
         self._lock_file: Any = None
 
@@ -256,6 +288,16 @@ class InferenceService:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._drain_task
             self._drain_task = None
+        # Stop any recovery still in flight so it cannot spawn a process
+        # while the service is going down.
+        for task in list(self._recovery_tasks):
+            task.cancel()
+        if self._recovery_tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._recovery_tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
         # Let accepted inference settle so no in-flight work is killed halfway
         # and no worker is left orphaned.  Bounded so shutdown cannot hang.
         if self._background:
@@ -368,6 +410,126 @@ class InferenceService:
         if body.get("label") not in artifact.labels:
             raise RuntimeError("candidate returned a label outside the label set")
         return body
+
+    # -- crash recovery --------------------------------------------------
+    def arm_recovery_delay(self, delay_ms: int) -> None:
+        """One-shot demo override for the next recovery's load delay."""
+        self._recovery_delay_override_ms = delay_ms
+
+    def _next_recovery_delay_ms(self) -> int:
+        override = self._recovery_delay_override_ms
+        self._recovery_delay_override_ms = None
+        if override is not None:
+            return override
+        return RECOVERY_DELAY_MS
+
+    def _start_recovery_task(self, version: str, ctx: Dict[str, Any]) -> None:
+        if self._closing:
+            return
+        task = asyncio.create_task(self._recover_version(version, ctx))
+        self._recovery_tasks.add(task)
+        task.add_done_callback(self._recovery_tasks.discard)
+
+    async def _reserve_recovery_slot(self, version: str) -> str:
+        """Reserve a slot for a recovery process, waiting briefly for a drain."""
+        deadline = time.monotonic() + SWAP_WAIT_SECONDS
+        while True:
+            try:
+                return self.registry.reserve_recovery_slot(version)
+            except NoCapacity:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(0.05)
+
+    async def _recover_version(self, version: str, ctx: Dict[str, Any]) -> None:
+        """The single automatic recovery attempt for one crash of ``version``.
+
+        Reloads the version's saved artifact in a new process, smoke-tests
+        it, and promotes it under the same version id.  Exactly one attempt
+        runs per failure; a failure is final (no retry loop).  If a manual
+        upload took over meanwhile, the late recovery stops only its own
+        candidate and leaves the new version untouched.
+        """
+        generation = int(ctx["generation"])
+        attempt = int(ctx["attempt"])
+        delay_ms = self._next_recovery_delay_ms()
+        handle: Optional[WorkerHandle] = None
+        try:
+            artifact = self._artifact_path(version)
+            if not artifact.is_file():
+                self.registry.fail_recovery(
+                    version,
+                    f"saved artifact {artifact} is missing; cannot recover",
+                )
+                return
+            if self._closing:
+                return
+            try:
+                slot_id = await self._reserve_recovery_slot(version)
+            except NoCapacity:
+                if self.registry.active_version() is not None:
+                    self.registry.recovery_superseded(version)
+                else:
+                    self.registry.fail_recovery(
+                        version, "no free process slot for recovery"
+                    )
+                return
+            except SwapConflict:
+                return  # the recovery was resolved by another path
+            handle = WorkerHandle(
+                slot_id=slot_id,
+                version=version,
+                model_path=str(artifact),
+                work_dir=str(WORK_DIR),
+            )
+            self.handles[version] = handle
+            if self._closing:
+                return
+            handle.spawn(slow_load_ms=max(0, delay_ms))
+            self.registry.set_pid(version, handle.pid or -1)
+
+            load_timeout = 30.0 + max(0, delay_ms) / 1000.0
+            ready = await asyncio.to_thread(handle.wait_ready, load_timeout)
+            if not ready.get("ok"):
+                raise RuntimeError(
+                    str(ready.get("error") or "worker reported load failure")
+                )
+            if ready.get("n_features") is not None:
+                self.registry.set_model_shape(
+                    version,
+                    int(ready["n_features"]),
+                    int(ready.get("n_classes", 0)),
+                )
+            await self._test_candidate(version, None)
+            self.registry.mark_recovery_tested(version, generation)
+            outcome = self.registry.commit_recovery(version, generation)
+            if outcome == "committed":
+                logger.info(
+                    "recovered model %s (attempt %d, pid=%s, generation=%d)",
+                    version,
+                    attempt,
+                    handle.pid,
+                    generation,
+                )
+                return
+            # A manual upload became active while this recovery was in
+            # flight.  The late recovery must not take over or stop the new
+            # version: stop only its own candidate, then free the slot.  The
+            # handle is popped first so the reaper does not mistake the
+            # intentional stop for another crash.
+            logger.info(
+                "recovery of %s superseded by a manual upload; stopping candidate",
+                version,
+            )
+            self.handles.pop(version, None)
+            await asyncio.to_thread(handle.stop, 5.0)
+            self.registry.recovery_superseded(version)
+        except Exception as exc:
+            logger.error("recovery of %s failed: %s", version, exc)
+            if handle is not None:
+                self.handles.pop(version, None)
+                await asyncio.to_thread(handle.stop, 5.0)
+            self.registry.fail_recovery(version, str(exc))
 
     # -- swap ------------------------------------------------------------
     async def swap_in_path(
@@ -563,6 +725,13 @@ class InferenceService:
             # so the machine does not appear full forever.
             if handle is not None and not handle.alive():
                 self._reap_dead_worker(version, info)
+            elif handle is None and info["state"] == VERSION_ACTIVE:
+                # Defensive: an active version without a process cannot serve.
+                ctx = self.registry.begin_recovery(
+                    version, "worker process handle is missing"
+                )
+                if ctx is not None:
+                    self._start_recovery_task(version, ctx)
 
             if info["state"] not in (VERSION_RETIRED, VERSION_FAILED):
                 continue
@@ -598,22 +767,56 @@ class InferenceService:
 
     def _reap_dead_worker(self, version: str, info: Dict[str, Any]) -> None:
         """Reclaim bookkeeping for a worker process that died unexpectedly."""
-        self.handles.pop(version, None)
-        if info["state"] in (VERSION_ACTIVE, VERSION_LOADING):
+        handle = self.handles.pop(version, None)
+        if handle is not None:
+            handle.wait_exit(2.0)  # confirm the OS process is really gone
+        # Re-read the registry: the snapshot state may be stale (a swap may
+        # have retired the version since).
+        current = self.registry.version_info(version) or info
+        state = current["state"]
+        if state == VERSION_ACTIVE:
+            # The serving process died: take the version out of service
+            # (inference gets 503) and start exactly one automatic recovery
+            # from the saved artifact.
+            reason = "worker process exited unexpectedly"
+            if handle is not None:
+                reason = (
+                    "worker process exited unexpectedly "
+                    f"(exit code {handle.returncode})"
+                )
+            ctx = self.registry.begin_recovery(version, reason)
+            if ctx is not None:
+                logger.error(
+                    "active model %s died; automatic recovery attempt %d starts",
+                    version,
+                    ctx["attempt"],
+                )
+                self._start_recovery_task(version, ctx)
+            return
+        if state == VERSION_RECOVERING:
+            # The recovery candidate itself died; the recovery task normally
+            # notices first -- this is the backstop.  No further retries.
+            self.registry.fail_recovery(
+                version, "recovery process exited unexpectedly"
+            )
+            return
+        if state == VERSION_LOADING:
             self.registry.settle_dead_worker(version)
-            if self.registry.fail_active(version, "worker process exited unexpectedly"):
-                logger.error("active model %s died; service has no active model", version)
-        elif info["state"] in (VERSION_RETIRED, VERSION_FAILED):
-            self.registry.settle_dead_worker(version)
-            with contextlib.suppress(Exception):
-                self.registry.release_slot(info["slot_id"], version, process_exited=True)
+            return
+        # Retired (draining) and failed versions do not self-heal; only the
+        # slot is reclaimed once the process is gone.
+        self.registry.settle_dead_worker(version)
+        with contextlib.suppress(Exception):
+            self.registry.release_slot(
+                current["slot_id"], version, process_exited=True
+            )
 
     # -- inference -------------------------------------------------------
     async def infer(
         self, features: List[float], timeout_ms: int, slow_ms: int = 0
     ) -> InferResponse:
         try:
-            version, _slot_id = self.registry.accept_work(len(features))
+            version, _slot_id, generation = self.registry.accept_work(len(features))
         except FeatureMismatch as exc:
             raise HTTPException(
                 status_code=422,
@@ -633,7 +836,7 @@ class InferenceService:
 
         handle = self.handles.get(version)
         if handle is None:  # pragma: no cover - registry/handle invariant
-            self.registry.complete_work(version)
+            self.registry.complete_work(version, generation)
             raise HTTPException(
                 status_code=503,
                 detail={"error": "worker_missing", "message": f"worker for {version} is gone"},
@@ -646,8 +849,12 @@ class InferenceService:
 
         # Shield the worker call from this request's timeout/cancellation.  The
         # in-flight counter must only clear when the model process is actually
-        # done; a 504 or disconnected client must not fake completion.
-        task = asyncio.create_task(self._proxy_inference(version, handle, payload))
+        # done; a 504 or disconnected client must not fake completion.  The
+        # generation tags the accepting process so a late completion from a
+        # crashed process is never booked against its recovered replacement.
+        task = asyncio.create_task(
+            self._proxy_inference(version, generation, handle, payload)
+        )
         self._background.add(task)
         task.add_done_callback(self._background.discard)
 
@@ -701,7 +908,11 @@ class InferenceService:
         )
 
     async def _proxy_inference(
-        self, version: str, handle: WorkerHandle, payload: Dict[str, Any]
+        self,
+        version: str,
+        generation: int,
+        handle: WorkerHandle,
+        payload: Dict[str, Any],
     ) -> Dict[str, Any]:
         try:
             assert self.client is not None
@@ -713,8 +924,11 @@ class InferenceService:
             return resp.json()
         finally:
             # Runs once, when the worker call actually settles.  This is the
-            # only place a request leaves the drain gate.
-            self.registry.complete_work(version)
+            # only place a request leaves the drain gate.  If the process
+            # crashed and the version was recovered in a new process, the
+            # generation no longer matches and this late callback is ignored
+            # instead of polluting the new process's counters.
+            self.registry.complete_work(version, generation)
 
     # -- status ----------------------------------------------------------
     def status(self) -> StatusView:
@@ -723,6 +937,7 @@ class InferenceService:
         total_in_flight = 0
         total_accepted = 0
         total_completed = 0
+        total_failed = 0
         active = snapshot["active_version"]
         for slot in snapshot["slots"]:
             handle = self.handles.get(slot["version"]) if slot["version"] else None
@@ -730,6 +945,7 @@ class InferenceService:
             total_in_flight += int(slot["in_flight"])
             total_accepted += int(slot["accepted"])
             total_completed += int(slot["completed"])
+            total_failed += int(slot.get("failed", 0))
             slots.append(
                 SlotView(
                     slot_id=slot["slot_id"],
@@ -739,6 +955,8 @@ class InferenceService:
                     in_flight=int(slot["in_flight"]),
                     accepted=int(slot["accepted"]),
                     completed=int(slot["completed"]),
+                    failed=int(slot.get("failed", 0)),
+                    generation=int(slot.get("generation", 0)),
                     alive=alive,
                 )
             )
@@ -748,6 +966,7 @@ class InferenceService:
             total_in_flight=total_in_flight,
             total_accepted=total_accepted,
             total_completed=total_completed,
+            total_failed=total_failed,
             slots_in_use=snapshot["slots_in_use"],
             capacity=snapshot["capacity"],
             slots=slots,
@@ -803,7 +1022,13 @@ app = FastAPI(
         "`timeout_seconds`) bounds the *client wait only*: on expiry you get 504 "
         "while the worker keeps working and keeps its slot.\n"
         "* `GET /admin/status` shows the active version, in-flight counts and each "
-        "process slot's state (`loading` / `active` / `draining` / `idle`).\n\n"
+        "process slot's state (`loading` / `active` / `draining` / `idle`).\n"
+        "* Crash recovery: if the active model process dies, the version is "
+        "taken out of service (`recovering`; `/infer` returns 503), its saved "
+        "weights are loaded in a fresh process, smoke-tested, and promoted "
+        "under the same version id. One attempt per failure; a failed recovery "
+        "is not retried. A manual upload can take over in parallel — a late "
+        "recovery then steps aside without touching the new version.\n\n"
         "**Demos**\n"
         "- Slow inference: `POST /infer` with `slow_ms: 3000`, `timeout_ms: 200`, "
         "then watch `/admin/status` and try uploading another version: while the "
@@ -811,7 +1036,12 @@ app = FastAPI(
         "- Load failure: upload with `simulate_load_failure: true` (or malformed "
         "weights). You get 502 and the old version remains active.\n"
         "- Capacity: trigger a slow in-flight request, swap once, then try a third "
-        "upload -> 429 until the slow work finishes and the slot is released."
+        "upload -> 429 until the slow work finishes and the slot is released.\n"
+        "- Crash recovery: `POST /admin/demo/kill-active` (optionally with "
+        "`recovery_delay_ms`) SIGKILLs the active model process. Watch "
+        "`/admin/status` show `recovering`, see `/infer` return 503, then the "
+        "same version id comes back active on a new pid. Upload a new version "
+        "during the delay to see it take priority over the recovery."
     ),
     lifespan=lifespan,
 )
@@ -922,3 +1152,63 @@ def versions() -> Dict[str, Any]:
 )
 def status() -> StatusView:
     return service.status()
+
+
+@app.post(
+    "/admin/demo/kill-active",
+    tags=["demo"],
+    summary="Demo: SIGKILL the active model process to exercise crash recovery",
+    responses={
+        200: {
+            "description": (
+                "Active model process killed. The service confirms the exit, "
+                "answers 503 until the automatic recovery loads the saved "
+                "artifact in a new process and promotes it under the same "
+                "version id."
+            )
+        },
+        409: {"description": "No active model process to kill"},
+    },
+)
+async def kill_active_model(req: KillActiveRequest) -> Dict[str, Any]:
+    version = service.registry.active_version()
+    if version is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "no_active_model",
+                "message": "there is no active model process to kill",
+            },
+        )
+    handle = service.handles.get(version)
+    info = service.registry.version_info(version) or {}
+    if handle is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "worker_missing",
+                "message": f"no worker process is tracked for {version!r}",
+            },
+        )
+    if req.recovery_delay_ms:
+        service.arm_recovery_delay(req.recovery_delay_ms)
+    pid = handle.pid
+    await asyncio.to_thread(handle.kill)
+    return {
+        "killed": {
+            "version": version,
+            "pid": pid,
+            "generation": info.get("generation"),
+        },
+        "recovery": (
+            "automatic: once the exit is confirmed, the saved artifact is "
+            "loaded in a new process, smoke-tested, and promoted under the "
+            "same version id (one attempt; no retry on failure)"
+        ),
+        "recovery_delay_ms": req.recovery_delay_ms or RECOVERY_DELAY_MS,
+        "watch": (
+            "GET /admin/status and /admin/versions show the old vs new "
+            "process and the recovery result; POST /infer returns 503 until "
+            "the recovery commits"
+        ),
+    }

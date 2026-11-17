@@ -5,12 +5,15 @@ Usage::
 
     python examples/demo.py [BASE_URL]
 
-Covers the three scenarios reviewers care about:
+Covers the scenarios reviewers care about:
 
 1. normal inference, then a successful hot swap;
 2. a failed candidate load (old version keeps serving);
 3. slow inference with a client timeout, followed by a swap and a third
-   upload that is refused until the slow work finishes and the slot is freed.
+   upload that is refused until the slow work finishes and the slot is freed;
+4. a crashed active model process: the service recovers it automatically
+   from the saved weights under the same version id (503 while recovering);
+5. a manual upload taking priority over a delayed recovery.
 """
 
 from __future__ import annotations
@@ -47,6 +50,16 @@ def slots():
     ]
     print(f"  status: active={st['active_version']} slots={layout}")
     return st
+
+
+def wait_for(predicate, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.3)
+    raise TimeoutError("condition not met in time")
 
 
 def artifact(version, weights, **extra):
@@ -94,13 +107,48 @@ def main() -> int:
     show("infer (v3 already serving)", client.post("/infer", json={"features": FEATURES}))
 
     print("\n== 5. wait for the slow work to finish; slot is released ==")
-    deadline = time.time() + 15
-    while time.time() < deadline:
-        st = slots()
-        if st["slots_in_use"] == 1:
-            break
-        time.sleep(0.5)
+    wait_for(lambda: slots()["slots_in_use"] == 1, timeout=20)
     show("upload v4 now", client.post("/admin/models", json=artifact("v4", W2)))
+    slots()
+
+    print("\n== 6. crash the active model; it recovers automatically ==")
+    active = slots()["active_version"]
+    show(
+        "kill active model (SIGKILL, delayed recovery)",
+        client.post("/admin/demo/kill-active", json={"recovery_delay_ms": 3000}),
+    )
+    wait_for(lambda: slots()["active_version"] is None)
+    show(
+        "infer while recovering (503)",
+        client.post("/infer", json={"features": FEATURES}),
+    )
+    wait_for(lambda: slots()["active_version"] == active)
+    st = client.get("/admin/status").json()
+    view = next(v for v in st["versions"] if v["version"] == active)
+    rec = view["recovery"]
+    print(
+        f"  recovered: version={active} state={view['state']} "
+        f"old(pid={rec['crashed_pid']},gen={rec['crashed_generation']}) -> "
+        f"new(pid={rec['recovered_pid']},gen={rec['recovered_generation']}) "
+        f"recovery={rec['state']}"
+    )
+    show("infer after recovery (same version)", client.post("/infer", json={"features": FEATURES}))
+
+    print("\n== 7. a manual upload takes priority over a delayed recovery ==")
+    show(
+        "kill active model (long recovery delay)",
+        client.post("/admin/demo/kill-active", json={"recovery_delay_ms": 6000}),
+    )
+    wait_for(lambda: slots()["active_version"] is None)
+    show("upload v5 during recovery", client.post("/admin/models", json=artifact("v5", W1)))
+    wait_for(
+        lambda: next(
+            v for v in client.get("/admin/status").json()["versions"] if v["version"] == active
+        )["recovery"]["state"]
+        == "superseded"
+    )
+    print(f"  late recovery of {active} stepped aside (superseded)")
+    show("infer (v5 serving)", client.post("/infer", json={"features": FEATURES}))
     slots()
     return 0
 

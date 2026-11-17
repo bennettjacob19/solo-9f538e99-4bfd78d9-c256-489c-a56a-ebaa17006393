@@ -12,6 +12,9 @@ services:
       # before the upload is refused with 429.
       SWAP_WAIT_SECONDS: "3"
       SHUTDOWN_GRACE_SECONDS: "20"
+      # Demo hook: delay every automatic crash recovery's load by this many
+      # milliseconds (the kill endpoint accepts a one-shot override).
+      RECOVERY_DELAY_MS: "0"
       LOG_LEVEL: INFO
       # Optional: load an existing artifact at startup.
       # BOOTSTRAP_VERSION: v1
